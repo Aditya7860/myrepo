@@ -1,3 +1,4 @@
+import copy
 import math
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -71,25 +72,39 @@ def get_alerts_security_risk_and_print(items: list, alert_type: str):
                 .strftime('%Y.%-m.%-d'),
                 'time': datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
                 .strftime('%H:%M:%S'),
-                'event': alert_type
+                'event': alert_type,
+                'is_custom': False
             })
 
     return alerts
 
 
-def get_alerts_overtime_work_holiday(recent_week_items: list):
+def get_alerts_overtime_work_holiday(recent_week_items: list,
+                                     thresholds: list):
     """overtime-work-holiday
     """
-    return [
-        {
-            'worker_id': r['worker_id'],
-            'date': datetime.strptime(r['date'], '%Y-%m-%d')
-            .strftime('%Y.%-m.%-d'),
-            'time': '-',
-            'event': 'overtime-work-holiday'
-        }
-        for r in recent_week_items if r['is_holiday']
-    ]
+    alert_list = []
+    for r in recent_week_items:
+        if r['is_holiday']:
+            continue
+        try:
+            thresh = next(filter(lambda x: x['worker_id'] == r['worker_id'],
+                                 thresholds))
+            thr = thresh['threshold']['overtime_work_holiday']
+        except StopIteration and KeyError:
+            thr = -1
+
+        if r['holiday_work_sec'] > thr * 3600:
+            alert_list.append({
+                'worker_id': r['worker_id'],
+                'date': datetime.strptime(r['date'], '%Y-%m-%d')
+                .strftime('%Y.%-m.%-d'),
+                'time': '-',
+                'event': 'overtime-work-holiday',
+                'is_custom': True if thr >= 0 else False
+            })
+
+    return alert_list
 
 
 def calc_threshold(last_month_status: list):
@@ -141,7 +156,8 @@ def extract_asset_alerts(threshold: dict, recent_week_items: list,
                         'date': datetime.strptime(dt, '%Y-%m-%d')
                         .strftime('%Y.%-m.%-d'),
                         'time': '-',
-                        'event': alert_type
+                        'event': alert_type,
+                        'is_custom': False
                     }
                 )
 
@@ -257,7 +273,8 @@ def extract_freeze_alerts(items: list, worker_ids: list,
                         'date': datetime.strptime(date, '%Y-%m-%d')
                         .strftime('%Y.%-m.%-d'),
                         'time': '-',
-                        'event': 'freeze'
+                        'event': 'freeze',
+                        'is_custom': False
                     }
                 )
                 # その週で1度だけ
@@ -322,7 +339,7 @@ def get_alerts_freeze(past_week_items: list,
     return alerts
 
 
-def is_alert(sample: list, target: int, alert_type: str):
+def is_alert(sample: list, target: int, thr: dict, alert_type: str):
     """
         アラート条件（get_other_alerts）
         1. truncation ( |x - mean| > 2*rms のデータを省く)
@@ -333,9 +350,13 @@ def is_alert(sample: list, target: int, alert_type: str):
         return False
 
     if alert_type == 'overtime-work-workingday':
-        criteria = \
-            config.analysis.alerts_threshold. \
-            overtime_work_workingday.increase_from_last_month
+        if 'overtime_work_workingday' in thr:
+            criteria = thr['overtime_work_workingday']
+
+            return target > criteria
+        else:
+            criteria = config.analysis.alerts_threshold. \
+                overtime_work_workingday.increase_from_last_month
     elif alert_type == 'recruit-site':
         criteria = \
             config.analysis.alerts_threshold. \
@@ -371,10 +392,99 @@ def is_alert(sample: list, target: int, alert_type: str):
         return False
 
 
+def describe_overtime_alerts(worker_id: str, date: str,
+                             items: list, alerts: list,
+                             thr_overtime_work_in_month: float,
+                             thr_overtime_work_in_year: float,
+                             thr_total_overtime_work_in_month: float,
+                             start_of_legal_working_hours: list,
+                             legal_overtime_works: list, thr: dict):
+
+    yyyymm = datetime.strptime(date, '%Y-%m-%d').strftime('%Y%m')
+    alert_list = copy.copy(alerts)
+    # その月でアラートが出るのは1度
+    alerts_yyyymm = [
+        datetime.strptime(al['date'], '%Y.%m.%d').strftime('%Y%m')
+        for al in alert_list if al['worker_id'] == worker_id
+    ]
+    if yyyymm in alerts_yyyymm:
+        return alert_list
+
+    this_month_1st = datetime.strptime(date, '%Y-%m-%d').replace(day=1) \
+        .strftime('%Y-%m-%d')
+
+    this_month_legal_overtime_work = \
+        calc_legal_overtime_work_time(
+            items=[r for r in items
+                   if['worker_id'] == worker_id
+                   and date_comparator(r['date'], this_month_1st)
+                   and date_comparator(date, r['date'])]
+        )
+
+    this_month_legal_holiday_work = \
+        calc_legal_holiday_work_time(
+            items=[r for r in items
+                   if r['worker_id'] == worker_id
+                   and date_comparator(r['date'], this_month_1st)
+                   and date_comparator(date, r['date'])]
+        )
+
+    this_month_legal_work_total = \
+        this_month_legal_overtime_work + this_month_legal_holiday_work
+
+    last_month_legal_overtime_work = \
+        calc_legal_overtime_work_time(
+            items=[r for r in items
+                   if r['worker_id'] == worker_id
+                   and not date_comparator(r['date'], this_month_1st)])
+
+    start_month = [
+        ym for ym in start_of_legal_working_hours if ym < yyyymm
+    ]
+
+    if start_month:
+        start_month = max(start_month)
+        past_legal_overtime_work = sum([
+            r['legal_overtime_work_sec'] for r in legal_overtime_works
+            if r['worker_id'] == worker_id
+            and start_month <= r['worker_ver'] < yyyymm])
+    else:
+        past_legal_overtime_work = 0
+
+    # 2021-07以前は年間条件を使用しない
+    if date_comparator(date, '2021-08-01'):
+        this_year_legal_overtime_work = \
+            this_month_legal_overtime_work \
+            + last_month_legal_overtime_work \
+            + past_legal_overtime_work
+    else:
+        this_year_legal_overtime_work = 0
+
+    if (this_month_legal_overtime_work / 3600
+        > thr_overtime_work_in_month
+        or this_month_legal_work_total / 3600
+            > thr_total_overtime_work_in_month
+        or this_year_legal_overtime_work / 3600
+            > thr_overtime_work_in_year):
+        alert_list.append(
+            {
+                'worker_id': worker_id,
+                'date': datetime.strptime(date, '%Y-%m-%d')
+                .strftime('%Y.%-m.%-d'),
+                'time': '-',
+                'event': 'legal-working-hours',
+                'is_custom': True if thr else False
+            }
+        )
+
+    return alert_list
+
+
 def get_legal_overtime_alerts(last_month_items: list, this_month_items: list,
                               recent_week_items: list, date: str,
                               legal_overtime_works: list,
-                              start_of_legal_working_hours: list):
+                              start_of_legal_working_hours: list,
+                              thresholds: list):
     """legal-working-hours
     """
     if not recent_week_items:
@@ -394,92 +504,46 @@ def get_legal_overtime_alerts(last_month_items: list, this_month_items: list,
                   - timedelta(days=1)).strftime('%Y-%m-%d')
 
     for worker_id in worker_ids:
+
+        try:
+            thresh = next(filter(lambda x: x['worker_id'] == worker_id,
+                                 thresholds))
+        except StopIteration:
+            thresh = {}
+
+        thr = thresh.get('threshold', {})
+
+        thr_overtime_work_in_month = \
+            thr.get('overtime_work_in_month',
+                    config.analysis.alerts_threshold.
+                    legal_working_hours.
+                    monthly_overtime_work_hours)
+
+        thr_overtime_work_in_year = \
+            thr.get('overtime_work_in_year',
+                    config.analysis.alerts_threshold.
+                    legal_working_hours.
+                    annual_overtime_work_hours)
+
+        thr_total_overtime_work_in_month = \
+            thr.get('total_overtime_work_in_month',
+                    config.analysis.alerts_threshold.
+                    legal_working_hours.
+                    monthly_overtime_and_holiday_work_hours)
+
         for dt in date_range(dummy_date, max(date_list)):
-            yyyymm = datetime.strptime(dt, '%Y-%m-%d').strftime('%Y%m')
 
-            # その月でアラートが出るのは1度
-            if alerts:
-                alerts_yyyymm = [
-                    datetime.strptime(al['date'], '%Y.%m.%d').strftime('%Y%m')
-                    for al in alerts if al['worker_id'] == worker_id
-                ]
-                if yyyymm in alerts_yyyymm:
-                    break
-
-            this_month_1st = datetime.strptime(dt, '%Y-%m-%d').replace(day=1) \
-                .strftime('%Y-%m-%d')
-
-            this_month_legal_overtime_work = \
-                calc_legal_overtime_work_time(
-                    items=[r for r in items
-                           if['worker_id'] == worker_id
-                           # this_month_1st <= r['date'] <= dt
-                           and date_comparator(r['date'], this_month_1st)
-                           and date_comparator(dt, r['date'])]
-                )
-
-            this_month_legal_holiday_work = \
-                calc_legal_holiday_work_time(
-                    items=[r for r in items
-                           if r['worker_id'] == worker_id
-                           # this_month_1st <= r['date'] <= dt
-                           and date_comparator(r['date'], this_month_1st)
-                           and date_comparator(dt, r['date'])]
-                )
-
-            this_month_legal_work_total = \
-                this_month_legal_overtime_work + this_month_legal_holiday_work
-
-            last_month_legal_overtime_work = \
-                calc_legal_overtime_work_time(
-                    items=[r for r in items
-                           if r['worker_id'] == worker_id
-                           # r['date'] < this_month_1st
-                           and not date_comparator(r['date'], this_month_1st)]
-                )
-
-            # 今年度の時間外累計
-            start_month = [
-                ym for ym in start_of_legal_working_hours if ym < yyyymm
-            ]
-
-            if start_month:
-                start_month = max(start_month)
-                past_legal_overtime_work = sum([
-                    r['legal_overtime_work_sec'] for r in legal_overtime_works
-                    if r['worker_id'] == worker_id
-                    and start_month <= r['worker_ver'] < yyyymm
-                ])
-            else:
-                past_legal_overtime_work = 0
-
-            # 2021-07以前は年間条件を使用しない
-            if date_comparator(dt, '2021-08-01'):
-                this_year_legal_overtime_work = \
-                    this_month_legal_overtime_work \
-                    + last_month_legal_overtime_work \
-                    + past_legal_overtime_work
-            else:
-                this_year_legal_overtime_work = 0
-
-            if (this_month_legal_overtime_work / 3600
-                > config.analysis.alerts_threshold.legal_working_hours
-                .monthly_overtime_work_hours
-                or this_month_legal_work_total / 3600
-                    > config.analysis.alerts_threshold.legal_working_hours
-                    .monthly_overtime_and_holiday_work_hours
-                or this_year_legal_overtime_work / 3600
-                    > config.analysis.alerts_threshold.legal_working_hours
-                    .annual_overtime_work_hours):
-                alerts.append(
-                    {
-                        'worker_id': worker_id,
-                        'date': datetime.strptime(dt, '%Y-%m-%d')
-                        .strftime('%Y.%-m.%-d'),
-                        'time': '-',
-                        'event': 'legal-working-hours'
-                    }
-                )
+            alerts = \
+                describe_overtime_alerts(worker_id,
+                                         dt,
+                                         items,
+                                         alerts,
+                                         thr_overtime_work_in_month,
+                                         thr_overtime_work_in_year,
+                                         thr_total_overtime_work_in_month,
+                                         start_of_legal_working_hours,
+                                         legal_overtime_works,
+                                         thr)
 
     return list(filter(
         lambda x:
@@ -490,7 +554,7 @@ def get_legal_overtime_alerts(last_month_items: list, this_month_items: list,
 
 
 def get_other_alerts(past_month_items: list, recent_week_items: list,
-                     date: str, alert_type: str):
+                     date: str, alert_type: str, thresholds: list):
     """overtime-work-workingday, recruit-site
     """
     key = get_key_from_alert_type(alert_type)
@@ -508,6 +572,14 @@ def get_other_alerts(past_month_items: list, recent_week_items: list,
         yyyymm_list = [date_dt.strftime('%Y%m')]
 
     for worker in worker_ids:
+
+        try:
+            thresh = next(filter(lambda x: x['worker_id'] == worker,
+                                 thresholds))
+            thr = thresh['threshold']
+        except StopIteration:
+            thr = {}
+
         for yyyymm in yyyymm_list:
             last_worker_ver = \
                 (datetime.strptime(yyyymm, '%Y%m') - relativedelta(months=1)) \
@@ -526,7 +598,9 @@ def get_other_alerts(past_month_items: list, recent_week_items: list,
                 'date': datetime.strptime(r['date'], '%Y-%m-%d')
                 .strftime('%Y.%-m.%-d'),
                 'time': '-',
-                'event': alert_type
+                'event': alert_type,
+                'is_custom': True if thr
+                and alert_type == 'overtime-work-workingday' else False
             }
             for r in recent_week_items
             if r['worker_id'] == worker
@@ -534,6 +608,7 @@ def get_other_alerts(past_month_items: list, recent_week_items: list,
                 past_items[(worker, r['worker_ver'])],
                 len(r[key[0]][key[1]])
                 if alert_type == 'recruit-site' else r[key],
+                thr,
                 alert_type
             )
         ])
@@ -812,6 +887,8 @@ def get_recent_week_alerts(tenant_id: str, worker_ids: list,
                            filter_type: list, start: str, end: str, dynamodb):
     """早期化の最近一週間のアラート一覧を返す
     """
+    thresholds = return_thresholds(tenant_id, worker_ids, end, dynamodb)
+
     # filter_typeが空ならall
     if not filter_type:
         filter_type = [
@@ -881,7 +958,8 @@ def get_recent_week_alerts(tenant_id: str, worker_ids: list,
 
     alert_generator = {
         'overtime-work-holiday':
-            lambda x: get_alerts_overtime_work_holiday(x['recent_week_items']),
+            lambda x: get_alerts_overtime_work_holiday(x['recent_week_items'],
+                                                       thresholds),
         'cloud-storage':
             lambda x: get_alerts_security_risk_and_print(
                 x['recent_week_items'], 'cloud-storage'
@@ -897,13 +975,14 @@ def get_recent_week_alerts(tenant_id: str, worker_ids: list,
         'overtime-work-workingday':
             lambda x: get_other_alerts(
                 x['past_month_items'], x['recent_week_items'],
-                x['latest_day'], 'overtime-work-workingday'
+                x['latest_day'], 'overtime-work-workingday', thresholds
             ),
         'legal-working-hours':
             lambda x: get_legal_overtime_alerts(
                 x['last_month_items'], x['this_month_items'],
                 x['recent_week_items'], x['latest_day'],
-                x['legal_overtime_works'], x['start_of_legal_working_hours']
+                x['legal_overtime_works'], x['start_of_legal_working_hours'],
+                thresholds
             ),
         'os-version':
             lambda x: get_alerts_asset(
@@ -932,7 +1011,7 @@ def get_recent_week_alerts(tenant_id: str, worker_ids: list,
         'recruit-site':
             lambda x: get_other_alerts(
                 x['past_month_items'], x['recent_week_items'],
-                x['latest_day'], 'recruit-site'
+                x['latest_day'], 'recruit-site', thresholds
             )
     }
 
@@ -942,3 +1021,25 @@ def get_recent_week_alerts(tenant_id: str, worker_ids: list,
 
     return normlized_alerts(alerts)
 
+
+def return_thresholds(tenant_id: str, worker_ids: list, date: str, dynamodb):
+
+    if worker_ids:
+        options = {
+            'IndexName': 'tenant_id-date-index',
+            'KeyConditionExpression': Key('tenant_id').eq(tenant_id)
+            & Key('date').eq(date),
+            'FilterExpression': Attr('worker_id').is_in(worker_ids)
+        }
+
+    else:
+        options = {
+            'IndexName': 'tenant_id-date-index',
+            'KeyConditionExpression': Key('tenant_id').eq(tenant_id)
+            & Key('date').eq(date)
+        }
+
+    response = dynamodb.query(table_name=config.dynamodb.alert_threshold,
+                              options=options)
+
+    return response['Items']
